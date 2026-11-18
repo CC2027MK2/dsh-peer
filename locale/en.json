@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Agent peer bridge",
+    "description": "Turns this DSH host into an MCP server, so the DSH running on another machine can message its agents as tools. Install it on both sides to let either agent ask the other.",
+    "detail": "README.md"
+  }
+}

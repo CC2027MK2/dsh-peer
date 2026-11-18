@@ -1,0 +1,43 @@
+{
+  "name": "dsh-peer",
+  "version": "0.1.0",
+  "description": "Expose this DSH host's agents over MCP (streamable HTTP) so the DSH on another machine can drive them as tools.",
+  "type": "module",
+  "license": "MIT",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "smoke.mjs",
+    "tools"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "mcp",
+    "model-context-protocol",
+    "agent",
+    "peer",
+    "collaboration"
+  ],
+  "scripts": {
+    "smoke": "node smoke.mjs"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

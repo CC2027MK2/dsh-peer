@@ -1,0 +1,14 @@
+- insert:
+    - id: dsh-peer
+      name: dsh-peer
+      config:
+        # The MCP endpoint lives at http://<host>:<port>/mcp
+        port: 38404
+        # Set a bearer token before exposing this host to an untrusted network;
+        # an empty token keeps the endpoint open (LAN / loopback only).
+        token: ''
+        # Peer conversation slots become sessions named "<prefix>:<slot>", so a
+        # peer can never address one of your own sessions by accident.
+        sessionPrefix: peer
+        # Upper bound on one peer_ask call, in milliseconds.
+        askTimeoutMs: 240000
