@@ -1,12 +1,15 @@
 /**
- * _mcp_probe.mjs — speak MCP to a *remote* dsh-peer endpoint from this machine.
+ * mcp-probe.mjs — speak MCP to a dsh-peer endpoint from the command line.
  *
- * Zero dependencies on purpose: it is the same JSON-RPC 2.0 the real
+ * Zero dependencies on purpose: it sends the same JSON-RPC 2.0 that
  * `@deepseek-ai/dsh-mcp-client` sends over its streamable-http transport, so a
- * pass here means the client will connect too. Used to prove the phone side
- * before wiring it into a profile.
+ * pass here means the real client will connect too. Handy for checking a peer
+ * before wiring it into a profile, and for calling arguments the client's cached
+ * tool schema may not know yet (`mode`, `taskId`, `idempotencyKey`).
  *
- *   node _mcp_probe.mjs http://192.0.2.20:38404/mcp
+ *   PEER_TOKEN=<token> node tools/mcp-probe.mjs http://192.0.2.20:38404/mcp ["prompt"]
+ *
+ * Env: PEER_TOKEN, PROBE_SLOT (default `probe`), PEER_ASK_TIMEOUT (ms).
  */
 
 import http from 'node:http'
@@ -86,15 +89,17 @@ try {
 if (parsed) {
   console.log(`peer_status : host=${parsed.host} platform=${parsed.platform} sessions=${parsed.sessions.length}`)
   console.log(`              model=${JSON.stringify(parsed.model)}`)
+  if (parsed.identity) console.log(`              identity=${parsed.identity} sandbox=${parsed.sandboxMode ?? '-'}`)
 } else {
   console.log(`peer_status : ${statusText.slice(0, 200)}`)
 }
 
-const history = await call('tools/call', { name: 'peer_history', arguments: { session: 'probe', limit: 4 } })
+const SLOT = process.env.PROBE_SLOT ?? 'probe'
+const history = await call('tools/call', { name: 'peer_history', arguments: { session: SLOT, limit: 4 } })
 console.log(`peer_history: ${(history.content?.[0]?.text ?? '').replace(/\s+/g, ' ').slice(0, 240)}`)
 
-const prompt = process.argv[3] ?? '用一句话说明你是哪个设备上的 DSH 智能体。'
-const askArgs = { prompt, session: 'probe' }
+const prompt = process.argv[3] ?? 'In one sentence, say which machine you are running on.'
+const askArgs = { prompt, session: SLOT }
 if (process.env.PEER_ASK_TIMEOUT) askArgs.timeoutMs = Number(process.env.PEER_ASK_TIMEOUT)
 const ask = await call('tools/call', { name: 'peer_ask', arguments: askArgs })
 const askText = ask.content?.[0]?.text ?? ''

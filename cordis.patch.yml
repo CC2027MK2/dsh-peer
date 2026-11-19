@@ -10,5 +10,31 @@
         # Peer conversation slots become sessions named "<prefix>:<slot>", so a
         # peer can never address one of your own sessions by accident.
         sessionPrefix: peer
-        # Upper bound on one peer_ask call, in milliseconds.
+        # Upper bound on one blocking peer_ask call, in milliseconds. Work that
+        # may take longer should use mode:"async" and peer_task instead.
         askTimeoutMs: 240000
+        # Live conversation slots kept warm; the least recently used is dropped
+        # once this many are open (each one holds a whole agent + event log).
+        maxSlots: 8
+        # Who this host is in the peer vocabulary. Setting it turns CHATv1 on:
+        # inbound envelopes are validated and deduplicated, outbound replies are
+        # stamped with from/msg/ts/reply so both sides can tell peers from humans.
+        identity: ''
+        chatProtocol: true
+        # A reply longer than this is split into `chunk=i/n` envelopes.
+        maxChunkChars: 60000
+        # Ceiling for one background (mode:"async") task.
+        taskTimeoutMs: 1800000
+        # Optional: read the token from a file instead of inlining it (wins over
+        # 	oken); keeps a shared profile free of plain-text secrets.
+        # tokenFile: ''
+        # Pin the sandbox mode for peer sessions. Hosts where no sandbox backend
+        # is usable (PRoot/containers) refuse workspace-write outright, so a peer
+        # that must run commands there needs danger-full-access.
+        # sandboxMode: danger-full-access
+        # Tool names to strip from peer sessions; use it to stop two peers from
+        # calling each other in a loop.
+        # denyTools: [mcp__phone__peer_ask]
+        # Optional preset for peer sessions (a preset without any MCP client is
+        # the other half of the loop guard).
+        # agentPreset: dsh-executor

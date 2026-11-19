@@ -13,7 +13,7 @@
 
 import http from 'node:http'
 import assert from 'node:assert/strict'
-import { apply } from './index.js'
+import { apply, parsePeerEnvelope, formatPeerEnvelope, splitBody, newMsgId } from './index.js'
 
 const PORT = Number(process.env.SMOKE_PORT ?? 38499)
 const BASE = `http://127.0.0.1:${PORT}`
@@ -129,7 +129,7 @@ try {
 
   // 5. tools/list
   const list = await rpc({ jsonrpc: '2.0', id: nextId++, method: 'tools/list', params: {} }, sessionId)
-  assert.equal(list.json.result.tools.length, 4)
+  assert.equal(list.json.result.tools.length, 5)
   for (const tool of list.json.result.tools) {
     assert.equal(tool.inputSchema.type, 'object')
     assert.ok(tool.description.length > 20, `${tool.name} needs a real description`)
@@ -176,6 +176,66 @@ try {
   // 10. GET on /mcp says "no server-initiated stream" instead of hanging.
   const stream = await get('/mcp')
   assert.equal(stream.status, 405)
+
+  // 11. CHATv1 envelopes round-trip, and a broken header is reported instead of
+  //     silently passing as a normal message.
+  const msgId = newMsgId('pc')
+  const header = formatPeerEnvelope({ from: 'pc', msg: msgId, reply: 'phone-20260101T000000Z-abc123' })
+  const ok = parsePeerEnvelope(`${header}\nhello there`)
+  assert.equal(ok.hasEnvelope, true)
+  assert.deepEqual(ok.problems, [])
+  assert.equal(ok.envelope.from, 'pc')
+  assert.equal(ok.envelope.msg, msgId)
+  assert.equal(ok.envelope.reply, 'phone-20260101T000000Z-abc123')
+  assert.equal(ok.body, 'hello there')
+
+  const bad = parsePeerEnvelope('[[CHATv1 from=PC! msg=short ts=yesterday]]\nbody')
+  assert.equal(bad.hasEnvelope, true)
+  assert.deepEqual(bad.problems.sort(), ['from', 'msg', 'ts'])
+  assert.equal(bad.body, 'body')
+
+  assert.equal(parsePeerEnvelope('just words').hasEnvelope, false)
+
+  // 12. A long body splits into chunks that reassemble exactly.
+  const long = 'x'.repeat(70000)
+  const pieces = splitBody(long, 30000)
+  assert.equal(pieces.length, 3)
+  assert.equal(pieces.join(''), long)
+
+  // 13. mode=async answers with a task id before the model would have replied,
+  //     and the task is readable through peer_task afterwards.
+  const started = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'peer_ask', arguments: { prompt: 'slow one', session: 'smoke', mode: 'async' } },
+    },
+    sessionId,
+  )
+  const accepted = JSON.parse(started.json.result.content[0].text)
+  assert.equal(accepted.status, 'accepted')
+  assert.match(accepted.task_id, /^t-/)
+
+  const polled = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'peer_task', arguments: { taskId: accepted.task_id, waitMs: 2000 } },
+    },
+    sessionId,
+  )
+  const task = JSON.parse(polled.json.result.content[0].text)
+  assert.equal(task.task_id, accepted.task_id)
+  assert.ok(['done', 'failed'].includes(task.status), `task should settle, got ${task.status}`)
+
+  // 14. Health reports the protocol state so an operator can see whether the
+  //     peer is speaking CHATv1 at all.
+  const health2 = JSON.parse((await get('/health')).text)
+  assert.equal(health2.identity, null)
+  assert.equal(health2.chatProtocol, false)
+  assert.equal(health2.maxChunkChars, 60000)
 
   console.log('SMOKE_OK')
   console.log(`  endpoint : ${BASE}/mcp`)
