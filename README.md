@@ -27,11 +27,14 @@ do both (that is how the diagram above is wired).
 
 | Tool (raw name) | Purpose | Input |
 | --- | --- | --- |
-| `peer_ask` | Send a prompt to the peer's agent | `prompt`, `session?`, `timeoutMs?`, `mode?` (`sync`\|`async`\|`poll`), `taskId?`, `idempotencyKey?` |
+| `peer_ask` | Send a prompt to the peer's agent | `prompt`, `session?`, `timeoutMs?`, `mode?` (`sync`\|`async`\|`poll`), `taskId?`, `idempotencyKey?`, `require?`, `artifacts?` |
 | `peer_task` | Wait for / read an async task | `taskId`, `waitMs?` (max 300 000) |
 | `peer_sessions` | List conversation slots and their turn counts | – |
 | `peer_history` | Read back the last messages of one slot | `session?`, `limit?` |
-| `peer_status` | Host, platform, model, identity, sandbox mode, task counters | – |
+| `peer_status` | Host, platform, model, identity, sandbox mode, **capabilities**, task counters | – |
+| `room_say` | Post one message into a group room | `room`, `text`, `to?`, `replyTo?` |
+| `room_sync` | Read room events after a seq, or long-poll for new ones | `room`, `since?`, `waitMs?` (max 120 000) |
+| `room_list` | List rooms with members, latest seq and last message | – |
 
 Through `dsh-mcp-client` these become `mcp__<serverName>__peer_ask` and friends,
 for example `mcp__phone__peer_ask` on the PC and `mcp__pc__peer_ask` on the phone.
@@ -67,6 +70,129 @@ An unparseable header is not thrown away: the text is treated as a human line an
 the peer is told which fields were malformed.
 
 This is a *convention*, not access control — the token is what authenticates.
+
+## Capabilities, preflight and artifacts
+
+Three rules that turn "I described the work" into "the work actually landed".
+
+### 1. Ask what the peer can do
+
+`peer_status` returns a `capabilities` object. Read it instead of guessing from
+the platform string — a Windows box and an Android container differ in shell,
+sandbox and writable roots, and none of that follows from "is it a phone":
+
+```json
+{
+  "protocol": "chatv1.1",
+  "identity": "phone",
+  "platform": "linux/arm64",
+  "cwd": "/root/workspace",
+  "shell": "bash",
+  "sandbox": "danger-full-access",
+  "tools": ["bash", "read", "write", "edit"],
+  "writableRoots": ["/root/workspace"],
+  "async": true,
+  "artifacts": { "fetch": true, "hosts": [], "maxBytes": 67108864, "strict": false },
+  "limits": { "maxChunkChars": 60000, "taskTimeoutMs": 1800000, "askTimeoutMs": 240000, "maxSlots": 8 }
+}
+```
+
+`tools: null` means the deployment did not declare a tool list; it never means
+"no tools". Declare yours with the `capabilities` config key.
+
+### 2. Preflight with `require`
+
+Pass `require` and the peer answers before spending a turn:
+
+```json
+{ "prompt": "build and install the APK", "require": { "tools": ["bash"], "sandbox": "danger-full-access" } }
+```
+
+If the host cannot satisfy it, the call returns immediately:
+
+```json
+{ "v": 1, "status": "failed", "error": "requirements not met",
+  "output": { "missing": ["sandbox:workspace-write (host is danger-full-access)"], "unverified": [], "capabilities": { … } } }
+```
+
+`unverified` is the third state: the host declares nothing, so it *might* be able
+to do it. That is a report, not a refusal.
+
+### 3. `artifacts[]`: verified, not described
+
+```json
+{
+  "prompt": "take this file and resize it",
+  "artifacts": [
+    { "role": "input", "url": "http://192.0.2.10:38405/in.png", "sha256": "…", "size": 20480 }
+  ]
+}
+```
+
+Each entry is checked before the agent runs: `HEAD` for existence and length,
+and a streamed `sha256` when a digest is given (bounded by `artifactMaxBytes`).
+Failures return `status: "failed"` with the concrete reason per entry, e.g.
+`sha256 mismatch: got 9f2c…`, `host example.org is not in artifactHosts`.
+
+Successful checks are:
+
+- prepended to the agent's prompt as a list it can trust;
+- written to `<data dir>/transfers/<port>/<ts>-<rand>.json` (last 200 kept);
+- attached to the task record, so `peer_task` shows them long after the message
+  itself was compacted away.
+
+Set `strictArtifacts: true` (or pass `require.artifacts: true`) and any URL named
+in the body must also appear in `artifacts[]` — a bare "the file is at <url>" is
+refused with `error: "artifact references are not declared"`.
+
+## Group rooms (three or more agents)
+
+Two agents can call each other. Three cannot do that without a hub: a mesh needs
+`N(N-1)` client rows and `N` reachable ports. So one host is the **hub** and the
+rest are members:
+
+```
+   pc ─────────┐
+               ├── hub (rooms: lobby, build)  ← append-only log, one seq per room
+   phone ──────┤
+               │
+   laptop ─────┘
+```
+
+Declare the rooms on the hub's config (an undeclared room is refused by name):
+
+```yaml
+rooms:
+  lobby:
+    members: [pc, phone, laptop]
+  build:
+    members: [pc, phone]
+roomMaxEvents: 2000
+```
+
+Members need **one** client row pointing at the hub, then:
+
+- `room_say { room, text, to?, replyTo? }` → `{ seq, msg, ts }`
+- `room_sync { room, since, waitMs? }` → events after `since`; with `waitMs` it
+  returns as soon as something arrives, so a member can block inside a turn
+  instead of polling from outside.
+- `room_list` → roster, latest seq, last message.
+
+Design notes, borrowed from systems that solved this already:
+
+- **Matrix / Nostr**: the log is the truth. Each room is a JSONL file with a
+  monotonic `seq`, so a member's cursor is a single number and replay after a
+  restart is exact.
+- **MQTT**: delivery is at-least-once by *reading*, not by pushing. A member that
+  was offline simply asks for everything after its cursor.
+- **A2A**: a message is addressed to the room by default and to one member via
+  `to`; membership is checked, so a whisper to a non-member is an error rather
+  than a line nobody receives.
+- **NAT**: nothing is pushed, so a member behind a phone hotspot never needs an
+  inbound port — the hub is the only reachable side.
+
+Rooms live at `<data dir>/rooms/<port>/<room>.jsonl` and are compacted back to
+`roomMaxEvents` once the file grows past 1.5×.
 
 ## Long tasks
 

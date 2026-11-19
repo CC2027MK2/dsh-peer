@@ -60,6 +60,12 @@ const AGENT_RETRY_MS = 30_000
 const DEFAULT_MAX_SLOTS = 8
 const DEFAULT_MAX_CHUNK_CHARS = 60000
 const DEFAULT_TASK_TIMEOUT_MS = 1800000
+/** Ceiling for one artifact download while validating a handoff. */
+const DEFAULT_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
+/** Per-request budget for HEAD/GET probes against an artifact URL. */
+const DEFAULT_ARTIFACT_TIMEOUT_MS = 20000
+/** Announced in capabilities so a caller can tell which envelope dialect is live. */
+const CHAT_PROTOCOL_TAG = 'chatv1.1'
 
 /* ------------------------------------------------------------------------- *
  * CHATv1 envelope
@@ -613,6 +619,37 @@ function toolDefinitions() {
             type: 'string',
             description: 'Repeating the same key returns the earlier task instead of starting a second one.',
           },
+          require: {
+            type: 'object',
+            description:
+              'Preflight checks against the peer capabilities. Unmet entries fail the call without spending a turn. ' +
+              'Shape: {tools?: string[], sandbox?: string, workdir?: string, artifacts?: boolean, async?: boolean}.',
+            properties: {
+              tools: { type: 'array', items: { type: 'string' } },
+              sandbox: { type: 'string' },
+              workdir: { type: 'string' },
+              artifacts: { type: 'boolean' },
+              async: { type: 'boolean' },
+            },
+            additionalProperties: false,
+          },
+          artifacts: {
+            type: 'array',
+            description:
+              'Files handed to the peer. Each entry is checked (HEAD, size, sha256) before the agent runs; ' +
+              'a failure returns status "failed" with the problems instead of a silent bad path.',
+            items: {
+              type: 'object',
+              properties: {
+                role: { type: 'string' },
+                url: { type: 'string' },
+                path: { type: 'string' },
+                sha256: { type: 'string' },
+                size: { type: 'number' },
+              },
+              additionalProperties: false,
+            },
+          },
         },
         required: ['prompt'],
         additionalProperties: false,
@@ -653,6 +690,44 @@ function toolDefinitions() {
     {
       name: 'peer_status',
       description: 'Report the peer host, its model selection, and whether real agent sessions are available.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    },
+    {
+      name: 'room_say',
+      description:
+        'Post one message into a group room so every member can read it. Members read with room_sync; ' +
+        'address `to` when the message is meant for one member, and `replyTo` when it answers an earlier seq.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string', description: 'Room name configured on this hub.' },
+          text: { type: 'string', description: 'Message body.' },
+          to: { type: 'string', description: 'Optional member identity to address directly.' },
+          replyTo: { type: 'number', description: 'Optional seq this message answers.' },
+        },
+        required: ['room', 'text'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'room_sync',
+      description:
+        'Read the events of a room after a sequence number. Pass waitMs to long-poll: the call returns as soon as ' +
+        'something new arrives, or when the budget runs out (then count is 0).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string', description: 'Room name.' },
+          since: { type: 'number', description: 'Last seq this member has already seen (default 0 = from the start).' },
+          waitMs: { type: 'number', description: 'Longest wait for new events, in milliseconds (max 120000).' },
+        },
+        required: ['room'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'room_list',
+      description: 'List the rooms this hub hosts, with members, latest seq and the last message.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     },
   ]
@@ -748,6 +823,25 @@ export function apply(ctx, config = {}) {
     : DEFAULT_MAX_SLOTS
   const dataDir = process.env.DSH_PEER_DATA ?? path.join(os.homedir(), '.dsh', 'peer')
   const logFile = config.logFile ?? path.join(dataDir, 'peer.log')
+  // Artifact handoff policy. A peer that sends `artifacts[]` gets each entry
+  // checked (HEAD, content-length, sha256) before the agent ever sees it, so
+  // "the file is on the share" stops being a claim taken on faith.
+  const artifactsPolicy = {
+    allowHosts: Array.isArray(config.artifactHosts)
+      ? config.artifactHosts.filter((h) => typeof h === 'string' && h.length > 0)
+      : [],
+    maxBytes: Number.isFinite(config.artifactMaxBytes) && Number(config.artifactMaxBytes) > 0
+      ? Math.floor(Number(config.artifactMaxBytes))
+      : DEFAULT_ARTIFACT_MAX_BYTES,
+    timeoutMs: Number.isFinite(config.artifactTimeoutMs) && Number(config.artifactTimeoutMs) > 0
+      ? Math.floor(Number(config.artifactTimeoutMs))
+      : DEFAULT_ARTIFACT_TIMEOUT_MS,
+    // When true, any URL in the message body must also appear in artifacts[].
+    strict: config.strictArtifacts === true,
+  }
+  // Deployment-declared abilities. Values left out stay null in `capabilities()`
+  // so a caller can distinguish "cannot" from "did not say".
+  const declaredCaps = config.capabilities && typeof config.capabilities === 'object' ? config.capabilities : {}
 
   try {
     fs.mkdirSync(path.dirname(logFile), { recursive: true })
@@ -788,6 +882,236 @@ export function apply(ctx, config = {}) {
     denyTools,
     maxSlots,
     slots: new Map(),
+  }
+
+  /**
+   * What this host promises it can do.
+   *
+   * Callers use this instead of guessing from the platform string: a Windows
+   * box and an Android container are different in shell, sandbox and writable
+   * roots, and none of that follows from "is it a phone".
+   */
+  const capabilities = () => {
+    const declaredTools = Array.isArray(declaredCaps.tools)
+      ? declaredCaps.tools.filter((tool) => typeof tool === 'string' && tool.length > 0)
+      : null
+    const declaredRoots = Array.isArray(declaredCaps.writableRoots)
+      ? declaredCaps.writableRoots.filter((root) => typeof root === 'string' && root.length > 0)
+      : [cwd, dataDir]
+    const declaredShell = typeof declaredCaps.shell === 'string' && declaredCaps.shell
+      ? declaredCaps.shell
+      : process.platform === 'win32'
+        ? 'pwsh'
+        : 'bash'
+    return {
+      protocol: chatProtocol ? CHAT_PROTOCOL_TAG : 'plain',
+      identity: identity || null,
+      platform: `${process.platform}/${process.arch}`,
+      cwd,
+      shell: declaredShell,
+      sandbox: sandboxMode || null,
+      // null means "the deployment did not say", never "it has no tools".
+      tools: declaredTools,
+      writableRoots: declaredRoots,
+      async: true,
+      artifacts: {
+        fetch: true,
+        hosts: artifactsPolicy.allowHosts,
+        maxBytes: artifactsPolicy.maxBytes,
+        strict: artifactsPolicy.strict,
+      },
+      limits: {
+        maxChunkChars,
+        taskTimeoutMs: taskTimeout,
+        askTimeoutMs: defaultTimeout,
+        maxSlots,
+      },
+    }
+  }
+
+  /** Normalise the `require` argument into a value we can actually check. */
+  const normalizeRequire = (raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const tools = Array.isArray(raw.tools)
+      ? raw.tools.filter((tool) => typeof tool === 'string' && tool.length > 0)
+      : []
+    const sandbox = typeof raw.sandbox === 'string' ? raw.sandbox : ''
+    const workdir = typeof raw.workdir === 'string' ? raw.workdir : ''
+    const artifacts = raw.artifacts === true
+    const wantsAsync = raw.async === true
+    if (!tools.length && !sandbox && !workdir && !artifacts && !wantsAsync) return null
+    return { tools, sandbox, workdir, artifacts, async: wantsAsync }
+  }
+
+  /**
+   * Preflight a `require` client-side of the agent.
+   *
+   * Failing here costs nothing; failing inside the agent costs a turn and
+   * usually ends in a `need_user` reply that the caller has to translate back
+   * into "your host cannot do this".
+   */
+  const checkRequire = (wanted) => {
+    const caps = capabilities()
+    const missing = []
+    const unverified = []
+    if (wanted.sandbox) {
+      if (!caps.sandbox) unverified.push(`sandbox:${wanted.sandbox} (host inherits its deployment policy)`)
+      else if (caps.sandbox !== wanted.sandbox) missing.push(`sandbox:${wanted.sandbox} (host is ${caps.sandbox})`)
+    }
+    if (wanted.tools.length) {
+      if (!caps.tools) {
+        unverified.push(`tools:${wanted.tools.join(',')} (host declares no tool list)`)
+      } else {
+        const have = new Set(caps.tools)
+        for (const tool of wanted.tools) if (!have.has(tool)) missing.push(`tool:${tool}`)
+      }
+    }
+    if (wanted.async && caps.async !== true) missing.push('async')
+    if (wanted.workdir && path.resolve(wanted.workdir) !== path.resolve(cwd)) {
+      unverified.push(`workdir:${wanted.workdir} (host cwd is ${cwd})`)
+    }
+    return { ok: missing.length === 0, missing, unverified, capabilities: caps }
+  }
+
+  /** Keep only the artifact entries that carry a location. */
+  const normalizeArtifacts = (raw) => {
+    if (!Array.isArray(raw)) return []
+    return raw
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => ({
+        role: typeof item.role === 'string' ? item.role : '',
+        url: typeof item.url === 'string' ? item.url : '',
+        file: typeof item.path === 'string' ? item.path : '',
+        sha256: typeof item.sha256 === 'string' ? item.sha256.trim().toLowerCase() : '',
+        size: Number.isFinite(item.size) ? Number(item.size) : null,
+      }))
+      .filter((item) => item.url || item.file)
+      .slice(0, 32)
+  }
+
+  const hashFile = (file) =>
+    new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256')
+      const stream = fs.createReadStream(file)
+      stream.on('error', reject)
+      stream.on('data', (chunk) => hash.update(chunk))
+      stream.on('end', () => resolve(hash.digest('hex')))
+    })
+
+  const fetchWithTimeout = async (url, init) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), artifactsPolicy.timeoutMs)
+    try {
+      return await fetch(url, { ...init, signal: controller.signal })
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** Hash a URL by streaming it, refusing anything over the byte budget. */
+  const hashUrl = async (url) => {
+    const response = await fetchWithTimeout(url, { method: 'GET' })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const hash = crypto.createHash('sha256')
+    let total = 0
+    for await (const chunk of response.body) {
+      total += chunk.length
+      if (total > artifactsPolicy.maxBytes) throw new Error(`artifact exceeds ${artifactsPolicy.maxBytes} bytes`)
+      hash.update(chunk)
+    }
+    return { sha256: hash.digest('hex'), size: total }
+  }
+
+  /**
+   * Check every declared artifact and return the ones worth trusting.
+   *
+   * A HEAD tells us the file exists and how big it is; a sha256 claim forces a
+   * full GET. Failures are collected rather than thrown so one bad entry does
+   * not hide the others.
+   */
+  const verifyArtifacts = async (list) => {
+    const verified = []
+    const problems = []
+    for (const item of list) {
+      const label = item.role || 'artifact'
+      try {
+        if (item.file) {
+          const stat = fs.statSync(item.file)
+          if (!stat.isFile()) throw new Error('not a regular file')
+          if (item.size !== null && stat.size !== item.size) {
+            throw new Error(`size ${stat.size} != declared ${item.size}`)
+          }
+          const digest = item.sha256 ? await hashFile(item.file) : null
+          if (digest && digest !== item.sha256) throw new Error(`sha256 mismatch: got ${digest}`)
+          verified.push({ role: label, path: item.file, sha256: digest ?? item.sha256 ?? null, size: stat.size })
+          continue
+        }
+        const parsed = new URL(item.url)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          throw new Error(`unsupported protocol ${parsed.protocol}`)
+        }
+        if (artifactsPolicy.allowHosts.length > 0 && !artifactsPolicy.allowHosts.includes(parsed.hostname)) {
+          throw new Error(`host ${parsed.hostname} is not in artifactHosts`)
+        }
+        let status = 0
+        let declaredLength = null
+        try {
+          const head = await fetchWithTimeout(item.url, { method: 'HEAD' })
+          status = head.status
+          declaredLength = Number(head.headers.get('content-length') ?? '') || null
+        } catch {
+          // Some static servers answer HEAD with 405; fall through to the GET
+          // path instead of treating the probe failure as a missing file.
+          status = 0
+        }
+        let digest = null
+        let size = declaredLength
+        if (item.sha256 || status === 0 || status >= 400) {
+          const full = await hashUrl(item.url)
+          digest = full.sha256
+          size = full.size
+        }
+        if (size !== null && item.size !== null && size !== item.size) {
+          throw new Error(`size ${size} != declared ${item.size}`)
+        }
+        if (item.sha256 && digest && digest !== item.sha256) {
+          throw new Error(`sha256 mismatch: got ${digest}`)
+        }
+        verified.push({ role: label, url: item.url, sha256: digest ?? item.sha256 ?? null, size })
+      } catch (err) {
+        problems.push({ role: label, url: item.url || null, path: item.file || null, error: String(err?.message ?? err) })
+      }
+    }
+    return { verified, problems }
+  }
+
+  /** Write one handoff record so a transfer leaves a trace on this host. */
+  const transfersDir = path.join(dataDir, 'transfers', String(port))
+  const recordTransfer = (record) => {
+    try {
+      fs.mkdirSync(transfersDir, { recursive: true })
+      const name = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}.json`
+      fs.writeFileSync(path.join(transfersDir, name), JSON.stringify(record, null, 2))
+      const files = fs.readdirSync(transfersDir).filter((f) => f.endsWith('.json')).sort()
+      for (const stale of files.slice(0, Math.max(0, files.length - 200))) {
+        try {
+          fs.unlinkSync(path.join(transfersDir, stale))
+        } catch {
+          /* best effort */
+        }
+      }
+      return name
+    } catch (err) {
+      log(`transfer: record failed: ${err?.message ?? err}`)
+      return null
+    }
+  }
+
+  /** Pull the URLs a message body refers to, for the strict-artifact check. */
+  const urlsInText = (text) => {
+    const found = new Set()
+    for (const match of String(text).matchAll(/https?:\/\/[^\s<>"')]+/g)) found.add(match[0])
+    return [...found]
   }
 
   /** Drop the least recently used slots once the cap is exceeded. */
@@ -943,7 +1267,7 @@ export function apply(ctx, config = {}) {
   }
   loadTasks()
 
-  const startTask = ({ prompt, session, timeoutMs, idempotencyKey, inbound, body }) => {
+  const startTask = ({ prompt, session, timeoutMs, idempotencyKey, inbound, body, artifacts }) => {
     if (idempotencyKey) {
       for (const task of tasks.values()) {
         if (task.idempotencyKey === idempotencyKey) return task
@@ -957,6 +1281,9 @@ export function apply(ctx, config = {}) {
       session: slot.sessionId,
       prompt: body.slice(0, 500),
       msgId: inbound?.envelope?.msg ?? '',
+      // Kept with the task so the caller can prove what was handed over long
+      // after the message itself was compacted away.
+      artifacts: Array.isArray(artifacts) ? artifacts : [],
       state: 'running',
       startedAt: Date.now(),
       finishedAt: 0,
@@ -993,7 +1320,7 @@ export function apply(ctx, config = {}) {
         status: task.state,
         duration_ms: (task.finishedAt || Date.now()) - task.startedAt,
         msg_id: task.msgId || null,
-        output: task.state === 'done' ? { reply: task.reply } : {},
+        output: task.state === 'done' ? { reply: task.reply, artifacts: task.artifacts ?? [] } : {},
         error: task.error ?? null,
         no_forward_ack: true,
       },
@@ -1010,6 +1337,114 @@ export function apply(ctx, config = {}) {
     }
     return describeTask(task)
   }
+
+  // ---------------------------------------------------------------------------
+  // Rooms: a group conversation that any number of agents can join.
+  //
+  // Topology is hub-and-spoke, deliberately. With N peers a mesh needs N(N-1)
+  // client rows and N inbound ports; a hub needs one row per member and one
+  // port. Members read with room_sync (a long-poll on a monotonic seq), so a
+  // member behind NAT never has to accept a connection.
+  //
+  // Borrowed from: Matrix/Nostr (append-only event log with per-room sequence,
+  // poll-since), MQTT (per-topic subscribers, at-least-once delivery), and
+  // A2A (a message may address one member instead of the room).
+  // ---------------------------------------------------------------------------
+  const roomSpecs = config.rooms && typeof config.rooms === 'object' ? config.rooms : {}
+  const roomMaxEvents = Number.isFinite(config.roomMaxEvents) && Number(config.roomMaxEvents) > 0
+    ? Math.floor(Number(config.roomMaxEvents))
+    : 2000
+  const roomsDir = path.join(dataDir, 'rooms', String(port))
+  const rooms = new Map()
+
+  const roomPath = (name) => path.join(roomsDir, `${name}.jsonl`)
+
+  const loadRoom = (name) => {
+    const spec = roomSpecs[name]
+    const members = Array.isArray(spec?.members)
+      ? spec.members.filter((m) => typeof m === 'string' && m.length > 0)
+      : []
+    const room = { name, members, events: [], seq: 0, cursors: new Map() }
+    try {
+      const text = fs.readFileSync(roomPath(name), 'utf8')
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue
+        try {
+          const event = JSON.parse(line)
+          room.events.push(event)
+          room.seq = Math.max(room.seq, Number(event.seq) || 0)
+        } catch {
+          /* skip a torn line rather than losing the whole room */
+        }
+      }
+    } catch {
+      /* a room starts empty */
+    }
+    if (room.events.length > roomMaxEvents) {
+      room.events = room.events.slice(-roomMaxEvents)
+    }
+    log(`room: loaded ${name} members=${members.join(',') || '-'} events=${room.events.length} seq=${room.seq}`)
+    return room
+  }
+
+  const roomFor = (name) => {
+    const key = typeof name === 'string' ? name.trim() : ''
+    if (!key) throw new Error('`room` must be a non-empty string')
+    if (!Object.prototype.hasOwnProperty.call(roomSpecs, key)) {
+      const known = Object.keys(roomSpecs)
+      throw new Error(`unknown room "${key}"${known.length ? `; configured: ${known.join(', ')}` : '; no rooms are configured'}`)
+    }
+    let room = rooms.get(key)
+    if (!room) {
+      room = loadRoom(key)
+      rooms.set(key, room)
+    }
+    return room
+  }
+
+  const appendRoomEvent = (room, event) => {
+    room.seq += 1
+    const stored = { seq: room.seq, ...event }
+    room.events.push(stored)
+    try {
+      fs.mkdirSync(roomsDir, { recursive: true })
+      fs.appendFileSync(roomPath(room.name), `${JSON.stringify(stored)}\n`)
+      if (room.events.length > roomMaxEvents * 1.5) {
+        room.events = room.events.slice(-roomMaxEvents)
+        fs.writeFileSync(roomPath(room.name), room.events.map((e) => `${JSON.stringify(e)}\n`).join(''))
+        log(`room: compacted ${room.name} to ${room.events.length} events`)
+      }
+    } catch (err) {
+      log(`room: write failed for ${room.name}: ${err?.message ?? err}`)
+    }
+    return stored
+  }
+
+  /**
+   * Events after `since`, optionally waiting for new ones.
+   *
+   * The wait is a poll rather than a promise registry: a room is read by agents
+   * that are already inside a turn, and a missed wake-up would hang that turn
+   * for as long as the caller's budget. Polling has no such failure mode.
+   */
+  const readRoom = async (room, since, waitMs) => {
+    const from = Number.isFinite(since) ? Number(since) : 0
+    const deadline = Date.now() + Math.max(0, Math.min(Number(waitMs) || 0, 120000))
+    let picked = room.events.filter((event) => event.seq > from)
+    while (picked.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      picked = room.events.filter((event) => event.seq > from)
+    }
+    return picked
+  }
+
+  const roomSummary = (room) => ({
+    room: room.name,
+    members: room.members,
+    seq: room.seq,
+    events: room.events.length,
+    last: room.events.length ? room.events[room.events.length - 1] : null,
+  })
 
   /** One JSON-RPC request → one JSON-RPC response (or null for notifications). */
   const handleMessage = async (message, state) => {
@@ -1049,7 +1484,7 @@ export function apply(ctx, config = {}) {
         const args = params?.arguments && typeof params.arguments === 'object' ? params.arguments : {}
         log(`tools/call ${toolName} ${JSON.stringify(Object.keys(args))}`)
         try {
-          const text = await callTool(toolName, args)
+          const text = await callTool(toolName, args, state?.callerIdentity ?? '')
           return rpcResult(id, toolText(text))
         } catch (err) {
           log(`tools/call ${toolName} failed: ${err?.message ?? err}`)
@@ -1068,7 +1503,10 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  const callTool = async (toolName, args) => {
+  const callTool = async (toolName, args, callerIdentity = '') => {
+    // A member behind the hub speaks with its own identity header, so the room
+    // log attributes the line to the sender instead of the hub operator.
+    const speaker = /^[a-z][a-z0-9_-]{0,31}$/.test(callerIdentity) ? callerIdentity : identity
     switch (toolName) {
       case 'peer_ask': {
         const prompt = typeof args.prompt === 'string' ? args.prompt : ''
@@ -1080,6 +1518,68 @@ export function apply(ctx, config = {}) {
           return pollTask(taskId, args.timeoutMs)
         }
         const timeoutMs = Number.isFinite(args.timeoutMs) ? Number(args.timeoutMs) : defaultTimeout
+        // Preflight first: a host that cannot satisfy `require` answers at once
+        // instead of spending a turn discovering it cannot.
+        const requirements = normalizeRequire(args.require)
+        if (requirements) {
+          const check = checkRequire(requirements)
+          if (!check.ok) {
+            log(`ask: refused require=${JSON.stringify(requirements)} missing=${check.missing.join(',')}`)
+            return JSON.stringify(
+              {
+                v: 1,
+                status: 'failed',
+                task_id: null,
+                duration_ms: 0,
+                msg_id: null,
+                output: { missing: check.missing, unverified: check.unverified, capabilities: check.capabilities },
+                evidence: [],
+                error: 'requirements not met',
+                no_forward_ack: true,
+              },
+              null,
+              2,
+            )
+          }
+        }
+        // Verify declared artifacts before the agent runs, then hand it a list it
+        // can trust instead of a path it has to hope about.
+        const artifactList = normalizeArtifacts(args.artifacts)
+        let artifactBlock = ''
+        let artifactSummary = []
+        if (artifactList.length) {
+          const checked = await verifyArtifacts(artifactList)
+          const record = recordTransfer({
+            at: new Date().toISOString(),
+            session: typeof args.session === 'string' ? args.session : 'default',
+            direction: 'in',
+            artifacts: checked.verified,
+            problems: checked.problems,
+          })
+          if (checked.problems.length) {
+            log(`ask: artifact verification failed (${checked.problems.length}) record=${record}`)
+            return JSON.stringify(
+              {
+                v: 1,
+                status: 'failed',
+                task_id: null,
+                duration_ms: 0,
+                msg_id: null,
+                output: { problems: checked.problems, record },
+                evidence: [],
+                error: 'artifact verification failed',
+                no_forward_ack: true,
+              },
+              null,
+              2,
+            )
+          }
+          artifactSummary = checked.verified
+          artifactBlock = `[peer] verified artifacts (checked before delivery):\n${checked.verified
+            .map((a) => `- role=${a.role} source=${a.url ?? a.path} sha256=${a.sha256 ?? 'n/a'} size=${a.size ?? 'n/a'}`)
+            .join('\n')}\n\n`
+          log(`ask: ${checked.verified.length} artifact(s) verified, record=${record}`)
+        }
         const admitted = admit(prompt)
         if (admitted.duplicate) {
           log(`ask: duplicate msg ${admitted.inbound.envelope.msg} ignored`)
@@ -1102,7 +1602,32 @@ export function apply(ctx, config = {}) {
         const note = admitted.malformed
           ? `\n\n[peer] this message had an incomplete CHATv1 header (${admitted.problems.join(', ')}); treated as a user line.\n`
           : ''
-        const outbound = admitted.malformed ? `${prompt}${note}` : admitted.body
+        let outbound = admitted.malformed ? `${prompt}${note}` : admitted.body
+        // Strict mode: every URL the body names must be one of the verified
+        // artifacts. This is the "description is not delivery" rule.
+        if (artifactsPolicy.strict || requirements?.artifacts === true) {
+          const declared = new Set(artifactList.map((item) => item.url).filter(Boolean))
+          const missingRefs = urlsInText(outbound).filter((url) => !declared.has(url))
+          if (missingRefs.length) {
+            log(`ask: strict artifacts refused ${missingRefs.length} undeclared url(s)`)
+            return JSON.stringify(
+              {
+                v: 1,
+                status: 'failed',
+                task_id: null,
+                duration_ms: 0,
+                msg_id: null,
+                output: { missing_artifacts: missingRefs, hint: 'pass each URL in artifacts[] with its sha256' },
+                evidence: [],
+                error: 'artifact references are not declared',
+                no_forward_ack: true,
+              },
+              null,
+              2,
+            )
+          }
+        }
+        if (artifactBlock) outbound = `${artifactBlock}${outbound}`
         if (mode === 'async') {
           const task = startTask({
             prompt: outbound,
@@ -1111,6 +1636,7 @@ export function apply(ctx, config = {}) {
             idempotencyKey: typeof args.idempotencyKey === 'string' ? args.idempotencyKey : '',
             inbound: admitted.inbound,
             body: outbound,
+            artifacts: artifactSummary,
           })
           return JSON.stringify(
             {
@@ -1168,6 +1694,7 @@ export function apply(ctx, config = {}) {
             identity: identity || '(unset)',
             chatProtocol,
             maxChunkChars,
+            capabilities: capabilities(),
             tasks: [...tasks.values()].map((task) => ({
               id: task.id,
               state: task.state,
@@ -1178,6 +1705,46 @@ export function apply(ctx, config = {}) {
             endpoint: `http://0.0.0.0:${port}/mcp`,
             sessions: [...host.slots.values()].map((slot) => slot.describe()),
           },
+          null,
+          2,
+        )
+      }
+      case 'room_say': {
+        const room = roomFor(args.room)
+        const text = typeof args.text === 'string' ? args.text : ''
+        if (!text.trim()) throw new Error('`text` must be a non-empty string')
+        const to = typeof args.to === 'string' ? args.to.trim() : ''
+        if (to && room.members.length > 0 && !room.members.includes(to)) {
+          throw new Error(`"${to}" is not a member of ${room.name} (members: ${room.members.join(', ')})`)
+        }
+        const event = appendRoomEvent(room, {
+          msg: newMsgId(speaker || 'anonymous'),
+          from: speaker || 'anonymous',
+          ts: new Date().toISOString(),
+          to: to || null,
+          reply_to: Number.isFinite(args.replyTo) ? Number(args.replyTo) : null,
+          text: text.slice(0, maxChunkChars),
+        })
+        log(`room: say ${room.name} seq=${event.seq} from=${event.from}${to ? ` to=${to}` : ''}`)
+        return JSON.stringify(
+          { v: 1, room: room.name, seq: event.seq, msg: event.msg, ts: event.ts, from: event.from, to: event.to },
+          null,
+          2,
+        )
+      }
+      case 'room_sync': {
+        const room = roomFor(args.room)
+        const since = Number.isFinite(args.since) ? Number(args.since) : 0
+        const events = await readRoom(room, since, args.waitMs)
+        return JSON.stringify(
+          { v: 1, room: room.name, since, seq: room.seq, count: events.length, events },
+          null,
+          2,
+        )
+      }
+      case 'room_list': {
+        return JSON.stringify(
+          { rooms: Object.keys(roomSpecs).map((name) => roomSummary(roomFor(name))) },
           null,
           2,
         )
@@ -1211,6 +1778,8 @@ export function apply(ctx, config = {}) {
             chatProtocol,
             maxChunkChars,
             taskTimeoutMs: taskTimeout,
+            capabilities: capabilities(),
+            rooms: Object.keys(roomSpecs),
             tasks: {
               known: tasks.size,
               running: [...tasks.values()].filter((task) => task.state === 'running').length,
@@ -1256,7 +1825,13 @@ export function apply(ctx, config = {}) {
       }
 
       const payload = await readJsonBody(req)
-      const state = { session: undefined }
+      const state = {
+        session: undefined,
+        // Optional per-client identity: a member's MCP client row can send
+        // `X-Peer-Identity: <name>` so room traffic is attributed to it rather
+        // than to this host. The token is still what authorises the call.
+        callerIdentity: String(req.headers['x-peer-identity'] ?? '').trim(),
+      }
       const incoming = Array.isArray(payload) ? payload : [payload]
       const responses = []
       for (const message of incoming) {

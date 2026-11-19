@@ -1,6 +1,6 @@
 {
   "name": "dsh-peer",
-  "version": "0.2.2",
+  "version": "0.4.1",
   "description": "Expose this DSH host's agents over MCP (streamable HTTP) so the DSH on another machine can drive them as tools.",
   "type": "module",
   "license": "MIT",

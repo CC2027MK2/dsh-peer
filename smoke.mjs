@@ -12,11 +12,19 @@
  */
 
 import http from 'node:http'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import crypto from 'node:crypto'
 import assert from 'node:assert/strict'
 import { apply, parsePeerEnvelope, formatPeerEnvelope, splitBody, newMsgId } from './index.js'
 
 const PORT = Number(process.env.SMOKE_PORT ?? 38499)
 const BASE = `http://127.0.0.1:${PORT}`
+// Keep every run isolated: rooms and tasks persist, and a leftover event would
+// make the seq assertions order-dependent.
+const DATA_DIR = path.join(os.tmpdir(), `dsh-peer-smoke-${process.pid}-${Date.now()}`)
+process.env.DSH_PEER_DATA = DATA_DIR
 
 const stubCtx = {
   services: new Map(),
@@ -36,13 +44,14 @@ const stubCtx = {
 let nextId = 1
 
 /** One POST to /mcp; returns { status, headers, json }. */
-function rpc(body, sessionId) {
+function rpc(body, sessionId, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body)
     const headers = {
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
       'Content-Length': Buffer.byteLength(payload),
+      ...extraHeaders,
     }
     if (sessionId) headers['Mcp-Session-Id'] = sessionId
     const req = http.request(`${BASE}/mcp`, { method: 'POST', headers }, (res) => {
@@ -78,7 +87,16 @@ function get(pathname) {
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-const handle = apply(stubCtx, { port: PORT, hostLabel: 'smoke-host' })
+const handle = apply(stubCtx, {
+  port: PORT,
+  hostLabel: 'smoke-host',
+  identity: 'smoke',
+  sandboxMode: 'danger-full-access',
+  strictArtifacts: true,
+  artifactHosts: ['127.0.0.1'],
+  capabilities: { tools: ['bash', 'read'], shell: 'pwsh', writableRoots: ['/tmp'] },
+  rooms: { lobby: { members: ['smoke', 'phone'] } },
+})
 await wait(300)
 
 try {
@@ -129,7 +147,7 @@ try {
 
   // 5. tools/list
   const list = await rpc({ jsonrpc: '2.0', id: nextId++, method: 'tools/list', params: {} }, sessionId)
-  assert.equal(list.json.result.tools.length, 5)
+  assert.equal(list.json.result.tools.length, 8)
   for (const tool of list.json.result.tools) {
     assert.equal(tool.inputSchema.type, 'object')
     assert.ok(tool.description.length > 20, `${tool.name} needs a real description`)
@@ -233,9 +251,240 @@ try {
   // 14. Health reports the protocol state so an operator can see whether the
   //     peer is speaking CHATv1 at all.
   const health2 = JSON.parse((await get('/health')).text)
-  assert.equal(health2.identity, null)
-  assert.equal(health2.chatProtocol, false)
+  assert.equal(health2.identity, 'smoke')
+  assert.equal(health2.chatProtocol, true)
   assert.equal(health2.maxChunkChars, 60000)
+
+  // 15. Capabilities are declared, not guessed: the caller can see the shell,
+  //     the sandbox and the artifact budget before sending work.
+  const caps = health2.capabilities
+  assert.equal(caps.protocol, 'chatv1.1')
+  assert.equal(caps.identity, 'smoke')
+  assert.equal(caps.sandbox, 'danger-full-access')
+  assert.equal(caps.shell, 'pwsh')
+  assert.deepEqual(caps.tools, ['bash', 'read'])
+  assert.equal(caps.artifacts.maxBytes, 64 * 1024 * 1024)
+  assert.equal(caps.limits.maxSlots, 8)
+  const statusCaps = JSON.parse(
+    (
+      await rpc(
+        { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name: 'peer_status', arguments: {} } },
+        sessionId,
+      )
+    ).json.result.content[0].text,
+  ).capabilities
+  assert.equal(statusCaps.protocol, 'chatv1.1')
+
+  // 16. require is checked before the agent runs: a sandbox mismatch answers
+  //     instantly instead of burning a turn.
+  const refused = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: {
+        name: 'peer_ask',
+        arguments: { prompt: 'do it', session: 'smoke', require: { sandbox: 'workspace-write' } },
+      },
+    },
+    sessionId,
+  )
+  const refusedPayload = JSON.parse(refused.json.result.content[0].text)
+  assert.equal(refusedPayload.status, 'failed')
+  assert.match(refusedPayload.error, /requirements not met/)
+  assert.ok(
+    refusedPayload.output.missing.some((entry) => entry.startsWith('sandbox:workspace-write')),
+    'must report the sandbox mismatch',
+  )
+
+  // 17. A declared tool the host does not have fails preflight too, while an
+  //     undeclared tool list reports "unverified" instead of blocking.
+  const missingTool = JSON.parse(
+    (
+      await rpc(
+        {
+          jsonrpc: '2.0',
+          id: nextId++,
+          method: 'tools/call',
+          params: { name: 'peer_ask', arguments: { prompt: 'x', session: 'smoke', require: { tools: ['browser'] } } },
+        },
+        sessionId,
+      )
+    ).json.result.content[0].text,
+  )
+  assert.equal(missingTool.status, 'failed')
+  assert.ok(missingTool.output.missing.includes('tool:browser'))
+
+  // 18. Artifacts are hashed before delivery: a good file is accepted, a bad
+  //     digest is refused with the reason, and an undeclared URL in the body is
+  //     rejected once strict mode is on.
+  const tmpFile = path.join(os.tmpdir(), `dsh-peer-smoke-${Date.now()}.txt`)
+  fs.writeFileSync(tmpFile, 'handoff payload')
+  const digest = crypto.createHash('sha256').update('handoff payload').digest('hex')
+  const goodArtifact = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: {
+        name: 'peer_ask',
+        arguments: {
+          prompt: 'consume this',
+          session: 'smoke',
+          mode: 'async',
+          artifacts: [{ role: 'input', path: tmpFile, sha256: digest, size: 15 }],
+        },
+      },
+    },
+    sessionId,
+  )
+  const acceptedTask = JSON.parse(goodArtifact.json.result.content[0].text)
+  assert.equal(acceptedTask.status, 'accepted', 'artifact check must pass before the task starts')
+
+  const badArtifact = JSON.parse(
+    (
+      await rpc(
+        {
+          jsonrpc: '2.0',
+          id: nextId++,
+          method: 'tools/call',
+          params: {
+            name: 'peer_ask',
+            arguments: {
+              prompt: 'consume this',
+              session: 'smoke',
+              artifacts: [{ role: 'input', path: tmpFile, sha256: 'deadbeef' }],
+            },
+          },
+        },
+        sessionId,
+      )
+    ).json.result.content[0].text,
+  )
+  assert.equal(badArtifact.status, 'failed')
+  assert.match(badArtifact.error, /artifact verification failed/)
+  assert.match(badArtifact.output.problems[0].error, /sha256 mismatch/)
+
+  const undeclared = JSON.parse(
+    (
+      await rpc(
+        {
+          jsonrpc: '2.0',
+          id: nextId++,
+          method: 'tools/call',
+          params: {
+            name: 'peer_ask',
+            arguments: { prompt: 'fetch http://127.0.0.1:9/nothing.bin and use it', session: 'smoke' },
+          },
+        },
+        sessionId,
+      )
+    ).json.result.content[0].text,
+  )
+  assert.equal(undeclared.status, 'failed')
+  assert.match(undeclared.error, /artifact references are not declared/)
+  assert.deepEqual(undeclared.output.missing_artifacts, ['http://127.0.0.1:9/nothing.bin'])
+  fs.unlinkSync(tmpFile)
+
+  // 19. Rooms: a hub keeps one ordered log, members read it with a seq cursor,
+  //     and addressing checks membership instead of silently dropping the line.
+  const say = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_say', arguments: { room: 'lobby', text: 'first line' } },
+    },
+    sessionId,
+  )
+  const said = JSON.parse(say.json.result.content[0].text)
+  assert.equal(said.room, 'lobby')
+  assert.equal(said.seq, 1)
+  assert.equal(said.from, 'smoke')
+  assert.equal(said.to, null)
+
+  const sync = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_sync', arguments: { room: 'lobby', since: 0 } },
+    },
+    sessionId,
+  )
+  const synced = JSON.parse(sync.json.result.content[0].text)
+  assert.equal(synced.count, 1)
+  assert.equal(synced.events[0].text, 'first line')
+  assert.equal(synced.seq, 1)
+
+  // A cursor that is already up to date returns nothing, so a member can poll
+  // without replaying the room each time.
+  const idle = JSON.parse(
+    (
+      await rpc(
+        { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name: 'room_sync', arguments: { room: 'lobby', since: 1 } } },
+        sessionId,
+      )
+    ).json.result.content[0].text,
+  )
+  assert.equal(idle.count, 0)
+
+  // 20. Addressing a non-member is an error, not a whisper nobody receives.
+  const badTo = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_say', arguments: { room: 'lobby', text: 'hi', to: 'nobody' } },
+    },
+    sessionId,
+  )
+  assert.equal(badTo.json.result.isError, true)
+  assert.match(badTo.json.result.content[0].text, /not a member/)
+
+  // 21. An unconfigured room is refused; rooms are declared, not created by
+  //     whoever asks for one.
+  const badRoom = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_say', arguments: { room: 'nowhere', text: 'hi' } },
+    },
+    sessionId,
+  )
+  assert.equal(badRoom.json.result.isError, true)
+  assert.match(badRoom.json.result.content[0].text, /unknown room/)
+
+  // 22. room_list summarises every configured room.
+  const rooms = JSON.parse(
+    (
+      await rpc(
+        { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name: 'room_list', arguments: {} } },
+        sessionId,
+      )
+    ).json.result.content[0].text,
+  )
+  assert.equal(rooms.rooms.length, 1)
+  assert.equal(rooms.rooms[0].room, 'lobby')
+  assert.deepEqual(rooms.rooms[0].members, ['smoke', 'phone'])
+  assert.equal(rooms.rooms[0].seq, 1)
+
+  // 23. A member's client row can name itself, so the hub attributes the line
+  //     to the sender instead of to the hub operator.
+  const asPhone = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_say', arguments: { room: 'lobby', text: 'hello from the phone' } },
+    },
+    sessionId,
+    { 'X-Peer-Identity': 'phone' },
+  )
+  const phoneLine = JSON.parse(asPhone.json.result.content[0].text)
+  assert.equal(phoneLine.from, 'phone')
+  assert.equal(phoneLine.seq, 2)
 
   console.log('SMOKE_OK')
   console.log(`  endpoint : ${BASE}/mcp`)
@@ -244,4 +493,9 @@ try {
 } finally {
   handle.close()
   await wait(100)
+  try {
+    fs.rmSync(DATA_DIR, { recursive: true, force: true })
+  } catch {
+    /* best effort */
+  }
 }

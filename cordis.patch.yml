@@ -26,7 +26,7 @@
         # Ceiling for one background (mode:"async") task.
         taskTimeoutMs: 1800000
         # Optional: read the token from a file instead of inlining it (wins over
-        # 	oken); keeps a shared profile free of plain-text secrets.
+        # token); keeps a shared profile free of plain-text secrets.
         # tokenFile: ''
         # Pin the sandbox mode for peer sessions. Hosts where no sandbox backend
         # is usable (PRoot/containers) refuse workspace-write outright, so a peer
@@ -38,3 +38,31 @@
         # Optional preset for peer sessions (a preset without any MCP client is
         # the other half of the loop guard).
         # agentPreset: dsh-executor
+        #
+        # Artifact handoff. A peer that sends `artifacts[]` gets every entry
+        # checked before the agent runs: HEAD for existence and size, sha256 for
+        # the bytes. `artifactHosts` is the allowlist of hosts we will fetch
+        # from; leave it empty to allow any host, or list hosts to pin them.
+        # artifactHosts: [192.0.2.10]
+        # artifactMaxBytes: 67108864
+        # artifactTimeoutMs: 20000
+        # When strictArtifacts is true, every URL named in a message body must
+        # also appear in artifacts[]; a bare "the file is at <url>" is refused.
+        # strictArtifacts: true
+        #
+        # What this host promises it can do, reported by peer_status. Everything
+        # here is optional: `tools: null` means "undeclared", not "no tools".
+        # capabilities:
+        #   tools: [bash, read, write, edit]
+        #   shell: bash
+        #   writableRoots: [/root/workspace]
+        #
+        # Group rooms. A room is a hub-hosted, append-only log: members read it
+        # with room_sync (poll-since), so a member behind NAT never needs a port.
+        # Declare rooms here; an undeclared room is refused by name.
+        # rooms:
+        #   lobby:
+        #     members: [pc, phone, laptop]
+        #   build:
+        #     members: [pc, phone]
+        # roomMaxEvents: 2000
