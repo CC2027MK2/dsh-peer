@@ -720,8 +720,69 @@ function toolDefinitions() {
           room: { type: 'string', description: 'Room name.' },
           since: { type: 'number', description: 'Last seq this member has already seen (default 0 = from the start).' },
           waitMs: { type: 'number', description: 'Longest wait for new events, in milliseconds (max 120000).' },
+          ack: { type: 'boolean', description: 'Mark what is returned as read for the calling member (default: delivered only).' },
         },
         required: ['room'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'room_pending',
+      description:
+        'List the messages this member still owes a read receipt for, oldest first. This is the redelivery view: ' +
+        'anything unread comes back here no matter how many times the member reconnected.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string', description: 'Room name.' },
+          identity: { type: 'string', description: 'Read on behalf of this member (hub operators only).' },
+        },
+        required: ['room'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'room_ack',
+      description: 'Acknowledge (mark read) every message up to `seq` for the calling member.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string', description: 'Room name.' },
+          seq: { type: 'number', description: 'Highest seq to acknowledge (default: the room head).' },
+        },
+        required: ['room'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'room_claim',
+      description:
+        'Take ownership of one message so two members do not both work on it. A second claim by another member ' +
+        'fails with the current owner instead of silently forking the work.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string', description: 'Room name.' },
+          seq: { type: 'number', description: 'Seq to own.' },
+        },
+        required: ['room', 'seq'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'room_accept',
+      description:
+        'Sign off a message you own (or were addressed by): verdict "accepted" or "rejected", with an optional note. ' +
+        'The verdict is recorded next to the message for good.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string', description: 'Room name.' },
+          seq: { type: 'number', description: 'Seq being signed off.' },
+          verdict: { type: 'string', enum: ['accepted', 'rejected'], description: 'Outcome.' },
+          note: { type: 'string', description: 'Why, in one or two sentences.' },
+        },
+        required: ['room', 'seq', 'verdict'],
         additionalProperties: false,
       },
     },
@@ -1446,6 +1507,102 @@ export function apply(ctx, config = {}) {
     last: room.events.length ? room.events[room.events.length - 1] : null,
   })
 
+  // ---------------------------------------------------------------------------
+  // Receipts, redelivery and ownership.
+  //
+  // A room that only appends cannot tell "nobody has read this yet" from "it was
+  // read and ignored". Receipts close that gap per member and per message:
+  //
+  //   queued ──(member syncs)──▶ delivered ──(member acks)──▶ read
+  //                                   │
+  //                                   └──(member claims)──▶ owned ──▶ accepted | rejected
+  //
+  // Borrowed from: SMTP DSN / XMPP XEP-0184 (per-recipient delivery + read
+  // receipts), MQTT QoS1 (redelivery until the subscriber acknowledges), and
+  // Redis Streams PEL / SQS visibility (a message stays pending until acked, so
+  // an offline member is redelivered everything it missed).
+  // ---------------------------------------------------------------------------
+  const receiptsByRoom = new Map()
+  const receiptsDir = roomsDir
+
+  const receiptsPath = (name) => path.join(receiptsDir, `${name}.receipts.json`)
+
+  const loadReceipts = (name) => {
+    if (receiptsByRoom.has(name)) return receiptsByRoom.get(name)
+    let map = {}
+    try {
+      map = JSON.parse(fs.readFileSync(receiptsPath(name), 'utf8'))
+    } catch {
+      map = {}
+    }
+    receiptsByRoom.set(name, map)
+    return map
+  }
+
+  const saveReceipts = (name, map) => {
+    try {
+      fs.mkdirSync(receiptsDir, { recursive: true })
+      fs.writeFileSync(receiptsPath(name), JSON.stringify(map))
+    } catch (err) {
+      log(`receipts: write failed for ${name}: ${err?.message ?? err}`)
+    }
+  }
+
+  /** Receipt record for one seq, created on first look. */
+  const receiptFor = (name, seq) => {
+    const map = loadReceipts(name)
+    const key = String(seq)
+    if (!map[key]) map[key] = { delivered: {}, read: {}, owner: null, ownedAt: 0, verdict: null, acceptedBy: null, note: null }
+    return map[key]
+  }
+
+  /** Who a message is for: its `to`, or every member except the sender. */
+  const audienceOf = (room, event) => {
+    if (event.to) return [event.to]
+    const others = room.members.filter((member) => member !== event.from)
+    return others.length > 0 ? others : [event.from]
+  }
+
+  /** Mark everything up to `seq` delivered/read for one member. */
+  const markSeen = (room, member, upto, { read = false } = {}) => {
+    const now = new Date().toISOString()
+    let touched = 0
+    for (const event of room.events) {
+      if (event.seq > upto) break
+      if (event.from === member) continue
+      if (!audienceOf(room, event).includes(member)) continue
+      const record = receiptFor(room.name, event.seq)
+      if (!record.delivered[member]) {
+        record.delivered[member] = now
+        touched += 1
+      }
+      if (read && !record.read[member]) {
+        record.read[member] = now
+        touched += 1
+      }
+    }
+    if (touched > 0) saveReceipts(room.name, loadReceipts(room.name))
+    return touched
+  }
+
+  /** Everything this member still owes an answer for, oldest first. */
+  const pendingFor = (room, member) =>
+    room.events
+      .filter((event) => event.seq > 0 && event.from !== member && audienceOf(room, event).includes(member))
+      .map((event) => ({ event, receipt: receiptFor(room.name, event.seq) }))
+      .filter(({ receipt }) => !receipt.read[member])
+      .map(({ event, receipt }) => ({
+        seq: event.seq,
+        msg: event.msg,
+        from: event.from,
+        to: event.to,
+        ts: event.ts,
+        text: event.text,
+        delivered: receipt.delivered[member] ?? null,
+        owner: receipt.owner,
+        verdict: receipt.verdict,
+      }))
+
   /** One JSON-RPC request → one JSON-RPC response (or null for notifications). */
   const handleMessage = async (message, state) => {
     if (!message || typeof message !== 'object') return rpcError(null, -32600, 'Invalid Request')
@@ -1736,8 +1893,92 @@ export function apply(ctx, config = {}) {
         const room = roomFor(args.room)
         const since = Number.isFinite(args.since) ? Number(args.since) : 0
         const events = await readRoom(room, since, args.waitMs)
+        const member = args.ack === false ? '' : speaker
+        let receipts = null
+        if (member) {
+          const upto = events.length > 0 ? events[events.length - 1].seq : since
+          const updated = markSeen(room, member, upto, { read: args.ack === true })
+          receipts = { member, acked: args.ack === true, updated }
+        }
         return JSON.stringify(
-          { v: 1, room: room.name, since, seq: room.seq, count: events.length, events },
+          {
+            v: 1,
+            room: room.name,
+            since,
+            seq: room.seq,
+            count: events.length,
+            receipts,
+            events,
+          },
+          null,
+          2,
+        )
+      }
+      case 'room_pending': {
+        const room = roomFor(args.room)
+        const member = /^[a-z][a-z0-9_-]{0,31}$/.test(String(args.identity ?? '')) ? String(args.identity) : speaker
+        if (!member) throw new Error('room_pending needs an identity (call it with a member header)')
+        const events = pendingFor(room, member)
+        return JSON.stringify({ v: 1, room: room.name, member, count: events.length, pending: events }, null, 2)
+      }
+      case 'room_ack': {
+        const room = roomFor(args.room)
+        const member = speaker
+        if (!member) throw new Error('room_ack needs an identity (call it with a member header)')
+        const upto = Number.isFinite(args.seq) ? Number(args.seq) : room.seq
+        const updated = markSeen(room, member, upto, { read: true })
+        log(`room: ack ${room.name} upto=${upto} member=${member} updated=${updated}`)
+        return JSON.stringify({ v: 1, room: room.name, member, seq: upto, updated }, null, 2)
+      }
+      case 'room_claim': {
+        const room = roomFor(args.room)
+        const seq = Number(args.seq)
+        const event = room.events.find((item) => item.seq === seq)
+        if (!event) throw new Error(`no message with seq ${seq} in ${room.name}`)
+        const owner = speaker
+        if (!owner) throw new Error('room_claim needs an identity (call it with a member header)')
+        const receipt = receiptFor(room.name, seq)
+        if (receipt.owner && receipt.owner !== owner) {
+          throw new Error(`seq ${seq} is already owned by ${receipt.owner}`)
+        }
+        if (!receipt.delivered[owner]) receipt.delivered[owner] = new Date().toISOString()
+        receipt.owner = owner
+        receipt.ownedAt = Date.now()
+        saveReceipts(room.name, loadReceipts(room.name))
+        log(`room: claim ${room.name} seq=${seq} owner=${owner}`)
+        return JSON.stringify({ v: 1, room: room.name, seq, owner, claimed_at: receipt.ownedAt }, null, 2)
+      }
+      case 'room_accept': {
+        const room = roomFor(args.room)
+        const seq = Number(args.seq)
+        const verdict = args.verdict
+        if (!['accepted', 'rejected'].includes(verdict)) throw new Error('`verdict` must be "accepted" or "rejected"')
+        const event = room.events.find((item) => item.seq === seq)
+        if (!event) throw new Error(`no message with seq ${seq} in ${room.name}`)
+        const by = speaker
+        if (!by) throw new Error('room_accept needs an identity (call it with a member header)')
+        const receipt = receiptFor(room.name, seq)
+        // Only the owner signs off, or the addressee when nobody has claimed it
+        // yet — never an unrelated bystander.
+        if (receipt.owner && receipt.owner !== by) {
+          throw new Error(`seq ${seq} is owned by ${receipt.owner}; only the owner can accept or reject it`)
+        }
+        if (!receipt.owner) {
+          if (!audienceOf(room, event).includes(by)) {
+            throw new Error(`seq ${seq} is not addressed to ${by}`)
+          }
+          receipt.owner = by
+          receipt.ownedAt = Date.now()
+        }
+        receipt.verdict = verdict
+        receipt.acceptedBy = by
+        receipt.note = typeof args.note === 'string' ? args.note.slice(0, 2000) : null
+        receipt.acceptedAt = new Date().toISOString()
+        if (!receipt.read[by]) receipt.read[by] = receipt.acceptedAt
+        saveReceipts(room.name, loadReceipts(room.name))
+        log(`room: accept ${room.name} seq=${seq} by=${by} verdict=${verdict}`)
+        return JSON.stringify(
+          { v: 1, room: room.name, seq, verdict, by, note: receipt.note, at: receipt.acceptedAt },
           null,
           2,
         )

@@ -33,7 +33,11 @@ do both (that is how the diagram above is wired).
 | `peer_history` | Read back the last messages of one slot | `session?`, `limit?` |
 | `peer_status` | Host, platform, model, identity, sandbox mode, **capabilities**, task counters | – |
 | `room_say` | Post one message into a group room | `room`, `text`, `to?`, `replyTo?` |
-| `room_sync` | Read room events after a seq, or long-poll for new ones | `room`, `since?`, `waitMs?` (max 120 000) |
+| `room_sync` | Read room events after a seq, or long-poll for new ones; marks them delivered (or read with `ack`) | `room`, `since?`, `waitMs?` (max 120 000), `ack?` |
+| `room_pending` | Everything this member still owes a receipt for (the redelivery view) | `room`, `identity?` |
+| `room_ack` | Mark up to `seq` as read for the calling member | `room`, `seq?` |
+| `room_claim` | Take ownership of one message so work is not forked | `room`, `seq` |
+| `room_accept` | Record the verdict (`accepted`\|`rejected`) and a note | `room`, `seq`, `verdict`, `note?` |
 | `room_list` | List rooms with members, latest seq and last message | – |
 
 Through `dsh-mcp-client` these become `mcp__<serverName>__peer_ask` and friends,
@@ -193,6 +197,41 @@ Design notes, borrowed from systems that solved this already:
 
 Rooms live at `<data dir>/rooms/<port>/<room>.jsonl` and are compacted back to
 `roomMaxEvents` once the file grows past 1.5×.
+
+### Receipts, redelivery and who owns the work
+
+A line in the log is only *queued* until somebody actually picks it up. Each
+room therefore keeps a receipt book next to the log, keyed by `seq`:
+
+```
+queued ──(member calls room_sync)──▶ delivered ──(room_ack)──▶ read
+                                         │
+                                         └──(room_claim)──▶ owned ──▶ accepted | rejected
+```
+
+- `room_sync` marks what it returns as **delivered** for the calling member. Pass
+  `ack: true` to mark it **read** in the same breath; otherwise call `room_ack`
+  separately once the work is actually done.
+- `room_pending { room }` is the redelivery view: everything this member still
+  owes a receipt for, oldest first. A member that reconnects after an hour is
+  told exactly what it missed — nothing has to be re-sent by hand.
+- `room_claim { room, seq }` makes one member the owner so two agents cannot
+  quietly both start the same job. A second claim fails with
+  `seq N is owned by <member>` instead of forking the work.
+- `room_accept { room, seq, verdict, note? }` records the outcome
+  (`accepted` / `rejected`) and who signed it off. Only the owner — or the
+  addressee when nobody has claimed it — may sign; a bystander gets
+  `only the owner can accept or reject it`.
+
+Receipts are per member and per `seq`, so acknowledging is never a global muting
+button: `phone` reading a line does not discharge `laptop`'s obligation. The book
+lives at `<rooms dir>/<room>.receipts.json`.
+
+The design is the same one mail and message queues converged on — SMTP DSNs,
+XMPP XEP-0184 message receipts, MQTT QoS 1, and Redis Streams' pending entries
+list / SQS visibility timeout — reduced to what an agent handoff actually needs:
+an explicit "I saw it", an explicit "I took it", and an explicit "here is the
+verdict".
 
 ## Long tasks
 

@@ -147,7 +147,7 @@ try {
 
   // 5. tools/list
   const list = await rpc({ jsonrpc: '2.0', id: nextId++, method: 'tools/list', params: {} }, sessionId)
-  assert.equal(list.json.result.tools.length, 8)
+  assert.equal(list.json.result.tools.length, 12)
   for (const tool of list.json.result.tools) {
     assert.equal(tool.inputSchema.type, 'object')
     assert.ok(tool.description.length > 20, `${tool.name} needs a real description`)
@@ -485,6 +485,104 @@ try {
   const phoneLine = JSON.parse(asPhone.json.result.content[0].text)
   assert.equal(phoneLine.from, 'phone')
   assert.equal(phoneLine.seq, 2)
+
+  // 24. Redelivery view: an unread line stays in the member's pending list
+  //     until it is acknowledged, no matter how often the member reconnects.
+  const pending = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_pending', arguments: { room: 'lobby' } },
+    },
+    sessionId,
+    { 'X-Peer-Identity': 'phone' },
+  )
+  const pend = JSON.parse(pending.json.result.content[0].text)
+  assert.equal(pend.member, 'phone')
+  assert.ok(pend.count >= 1, 'the unread line must be redelivered')
+  assert.ok(
+    pend.pending.every((item) => item.seq !== 2),
+    'a member does not owe a receipt for its own line',
+  )
+
+  // 25. room_ack clears it.
+  const acked = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_ack', arguments: { room: 'lobby', seq: 2 } },
+    },
+    sessionId,
+    { 'X-Peer-Identity': 'phone' },
+  )
+  const ack = JSON.parse(acked.json.result.content[0].text)
+  assert.ok(ack.updated >= 1)
+  const afterAck = JSON.parse(
+    (
+      await rpc(
+        { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name: 'room_pending', arguments: { room: 'lobby' } } },
+        sessionId,
+        { 'X-Peer-Identity': 'phone' },
+      )
+    ).json.result.content[0].text,
+  )
+  assert.equal(afterAck.count, 0)
+
+  // 26. Ownership: the first claim wins and the second is refused with the
+  //     owner's name, so two members cannot quietly fork the same work.
+  const claimed = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_claim', arguments: { room: 'lobby', seq: 1 } },
+    },
+    sessionId,
+    { 'X-Peer-Identity': 'phone' },
+  )
+  assert.equal(JSON.parse(claimed.json.result.content[0].text).owner, 'phone')
+  const contest = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_claim', arguments: { room: 'lobby', seq: 1 } },
+    },
+    sessionId,
+    { 'X-Peer-Identity': 'smoke' },
+  )
+  assert.equal(contest.json.result.isError, true)
+  assert.match(contest.json.result.content[0].text, /already owned by phone/)
+
+  // 27. Acceptance: only the owner signs off, and the verdict is recorded.
+  const accepted2 = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_accept', arguments: { room: 'lobby', seq: 1, verdict: 'accepted', note: 'read and done' } },
+    },
+    sessionId,
+    { 'X-Peer-Identity': 'phone' },
+  )
+  const verdict = JSON.parse(accepted2.json.result.content[0].text)
+  assert.equal(verdict.verdict, 'accepted')
+  assert.equal(verdict.by, 'phone')
+  assert.equal(verdict.note, 'read and done')
+  const outsider = await rpc(
+    {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: { name: 'room_accept', arguments: { room: 'lobby', seq: 1, verdict: 'rejected' } },
+    },
+    sessionId,
+    { 'X-Peer-Identity': 'smoke' },
+  )
+  assert.equal(outsider.json.result.isError, true)
+  assert.match(outsider.json.result.content[0].text, /only the owner can accept or reject/)
 
   console.log('SMOKE_OK')
   console.log(`  endpoint : ${BASE}/mcp`)
