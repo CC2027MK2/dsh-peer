@@ -2,10 +2,14 @@
 
 Let two DeepSeek Harness installations talk to each other.
 
-`dsh-peer` is a **zero-dependency MCP server** that exposes the local agent as five
-MCP tools. Combined with the stock `@deepseek-ai/dsh-mcp-client`, it turns
+`dsh-peer` is a **zero-dependency MCP server** that exposes the local agent as
+twelve MCP tools. Combined with the stock `@deepseek-ai/dsh-mcp-client`, it turns
 "my laptop's agent" and "my phone's agent" into two peers that can ask each other
-questions over the LAN — no cloud relay, no shared session file.
+questions over the LAN — no cloud relay, no shared session file. Three or more
+agents can share a room with delivery receipts, redelivery and explicit
+ownership.
+
+> 中文功能说明（可直接用于介绍/推广）：[`docs/promotion.zh-CN.md`](docs/promotion.zh-CN.md)
 
 ```
    PC (DSH desktop)                          Phone (DSH Go)
